@@ -18,18 +18,10 @@ package release
 
 import (
 	"context"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-	"helm.sh/helm/v3/pkg/chart"
-	"helm.sh/helm/v3/pkg/release"
-	"helm.sh/helm/v3/pkg/storage/driver"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	ktype "sigs.k8s.io/kustomize/api/types"
+	"github.com/crossplane/crossplane-runtime/pkg/fieldpath"
 
 	runtimev1alpha1 "github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
@@ -37,6 +29,18 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	"github.com/pkg/errors"
+	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/release"
+	"helm.sh/helm/v3/pkg/storage/driver"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	ktype "sigs.k8s.io/kustomize/api/types"
 
 	"github.com/crossplane-contrib/provider-helm/apis/release/v1beta1"
 	helmv1beta1 "github.com/crossplane-contrib/provider-helm/apis/v1beta1"
@@ -242,9 +246,14 @@ func (e *helmExternal) Observe(ctx context.Context, mg resource.Managed) (manage
 		cr.Status.SetConditions(runtimev1alpha1.Unavailable())
 	}
 
+	cd, err := connectionDetails(ctx, e.kube, cr)
+	if err != nil {
+		return managed.ExternalObservation{}, err
+	}
 	return managed.ExternalObservation{
-		ResourceExists:   true,
-		ResourceUpToDate: cr.Status.Synced && !(shouldRollBack(cr) && !rollBackLimitReached(cr)),
+		ResourceExists:    true,
+		ResourceUpToDate:  cr.Status.Synced && !(shouldRollBack(cr) && !rollBackLimitReached(cr)),
+		ConnectionDetails: cd,
 	}, nil
 }
 
@@ -348,6 +357,64 @@ func (e *helmExternal) Delete(_ context.Context, mg resource.Managed) error {
 	return errors.Wrap(e.helm.Uninstall(meta.GetExternalName(cr)), errFailedToUninstall)
 }
 
+func connectionDetails(ctx context.Context, kube client.Client, cr *v1beta1.Release) (managed.ConnectionDetails, error) {
+	mcd := managed.ConnectionDetails{}
+	for _, cd := range cr.Spec.ConnectionDetails {
+		if cd.Kind == "Secret" {
+			dat, err := getSecretData(ctx, kube, types.NamespacedName{
+				Namespace: cd.Namespace,
+				Name:      cd.Name,
+			})
+			if err != nil {
+				return mcd, err
+			}
+			if cd.FieldPath != "" {
+				k := strings.TrimPrefix(cd.FieldPath, "data")
+				mcd[k] = dat[k]
+				continue
+			}
+			for k, v := range dat {
+				mcd[k] = v
+			}
+			continue
+		}
+		if cd.Kind == "ConfigMap" {
+			dat, err := getConfigMapData(ctx, kube, types.NamespacedName{
+				Namespace: cd.Namespace,
+				Name:      cd.Name,
+			})
+			if err != nil {
+				return mcd, err
+			}
+			if cd.FieldPath != "" {
+				k := strings.TrimPrefix(cd.FieldPath, "data")
+				mcd[k] = []byte(dat[k])
+				continue
+			}
+			for k, v := range dat {
+				mcd[k] = []byte(v)
+			}
+			continue
+		}
+
+		ro := unstructuredFromObjectRef(cd.ObjectReference)
+		if err := kube.Get(ctx, types.NamespacedName{Name: ro.GetName(), Namespace: ro.GetNamespace()}, &ro); err != nil {
+			return mcd, err
+		}
+
+		paved := fieldpath.Pave(ro.Object)
+		v, err := paved.GetString(cd.FieldPath)
+		if err != nil {
+			return mcd, err
+		}
+		// TODO(hasan): get integer if not string ?
+
+		mcd[cd.ToConnectionSecretKey] = []byte(v)
+	}
+
+	return mcd, nil
+}
+
 func shouldRollBack(cr *v1beta1.Release) bool {
 	return rollBackEnabled(cr) &&
 		((cr.Status.Synced && cr.Status.AtProvider.State == release.StatusFailed) ||
@@ -360,4 +427,14 @@ func rollBackEnabled(cr *v1beta1.Release) bool {
 }
 func rollBackLimitReached(cr *v1beta1.Release) bool {
 	return cr.Status.Failed >= *cr.Spec.RollbackRetriesLimit
+}
+
+func unstructuredFromObjectRef(r v1.ObjectReference) unstructured.Unstructured {
+	u := unstructured.Unstructured{}
+	u.SetAPIVersion(r.APIVersion)
+	u.SetKind(r.Kind)
+	u.SetName(r.Name)
+	u.SetNamespace(r.Namespace)
+
+	return u
 }

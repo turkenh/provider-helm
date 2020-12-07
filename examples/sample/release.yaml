@@ -31,5 +31,19 @@ spec:
 #         name: svals
 #         namespace: wordpress
 #         optional: false
+  connectionDetails:
+    - apiVersion: v1
+      kind: Secret
+      name: wordpress-example-mariadb
+      namespace: wordpress
+    - apiVersion: v1
+      kind: Service
+      name: wordpress-example
+      namespace: wordpress
+      fieldPath: spec.clusterIP
+      toConnectionSecretKey: clusterip
+  writeConnectionSecretToRef:
+    name: testt
+    namespace: crossplane-system
   providerConfigRef:
     name: helm-provider
